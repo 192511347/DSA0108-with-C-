@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TANK SIEGE - Authoritative Multiplayer</title>
+<style>
+  body{margin:0;background:#2b2a26;color:#2a2418;font:13px/1.4 system-ui,Segoe UI,sans-serif;display:flex;gap:14px;justify-content:center;align-items:flex-start;padding:14px;flex-wrap:wrap}
+  canvas{border:4px solid #4a4435;border-radius:6px;box-shadow:0 6px 24px #0008;max-width:100%;cursor:crosshair;background:#d8c7a0}
+  .side{width:310px;display:flex;flex-direction:column;gap:10px}
+  .box{background:#efe6cf;border:2px solid #4a4435;border-radius:6px;padding:10px}
+  h3{margin:0 0 6px;font-size:12px;letter-spacing:2px;color:#6b4e16}
+  input,select,button{background:#fffaf0;color:#2a2418;border:1px solid #4a4435;border-radius:4px;padding:6px 8px;font:inherit}
+  button{cursor:pointer;background:#c9a24a;font-weight:600}button:hover{background:#dcb55c}
+  .row{display:flex;gap:6px;margin-bottom:6px}.row input{flex:1;min-width:0}
+  pre{margin:0;white-space:pre-wrap;font:12px/1.35 Consolas,Menlo,monospace}
+  #st{font-weight:700}.ok{color:#1d7a2e}.bad{color:#b3261e}
+</style>
+</head>
+<body>
+<canvas id="cv" width="800" height="600"></canvas>
+<div class="side">
+  <div class="box"><h3>1 - CONNECT</h3>
+    <div class="row"><input id="addr" placeholder="host-ip:8080"><button id="conn">Connect</button></div>
+    <div id="st" class="bad">offline</div>
+    <div style="font-size:11px;margin-top:4px">Other device? Type the host's IP shown in the server console, e.g. 192.168.1.20:8080 (or just open that URL in the browser).</div>
+  </div>
+  <div class="box"><h3>2 - LOBBY</h3>
+    <div class="row"><input id="room" placeholder="room name (blank = quick match)"><button id="join">Join</button></div>
+    <div id="rooms" style="margin-bottom:6px">no open rooms</div>
+    <button id="ready">Ready</button> <button id="leave" style="display:none"></button>
+    <div id="lobby" style="margin-top:8px"></div>
+  </div>
+  <div class="box"><h3>NETCODE TELEMETRY</h3><pre id="tel"></pre></div>
+  <div class="box"><h3>DEMO TOOLS</h3>
+    Latency (one-way) <select id="lag"><option value="0">0 ms</option><option value="80">80 ms</option><option value="200">200 ms</option><option value="400">400 ms</option></select><br>
+    Input packet loss <select id="loss"><option value="0">0 %</option><option value="15">15 %</option><option value="40">40 %</option></select><br>
+    <label><input type="checkbox" id="ghost" checked style="padding:0"> show server ghost ring</label><br><br>
+    <button id="hack">Simulate teleport hack</button>
+  </div>
+  <div class="box"><h3>EVENT LOG</h3><pre id="log"></pre></div>
+</div>
+<script>
+(() => {
+'use strict';
+// ------------------------------- Constants ---------------------------------
+const W = 800, H = 600, R = 16, SPEED = 220, INTERP_MS = 100, FIRE_CD = 280;   // SPEED < server MAX_SPEED
+const WALLS = [[350,250,100,100],[160,140,140,20],[500,440,140,20],[150,330,20,120],[630,150,20,120]]; // = server WALLS
+const COLORS = ['#1e6fff', '#2e9d3f', '#ff8c1a', '#c2255c'];   // local = blue; remotes = green / orange / crimson
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const $ = id => document.getElementById(id);
+const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+
+// --------------------------------- State -----------------------------------
+const net = { ws: null, lag: 0, loss: 0, rtt: 0, snaps: 0, snapRate: 0, sent: 0, dropped: 0, rollbacks: 0, lastErr: 0, maxErr: 0, replayed: 0, wasUp: false };
+const S = { myId: 0, room: '-', inMatch: false, epoch: 0, seq: 0, ack: 0, tick: 0, hp: 100,
+            inputQueue: [],                       // unacknowledged inputs {seq,dx,dy,dt}
+            me: { x: 400, y: 300 }, srv: { x: 400, y: 300 }, body: 0, aim: 0, mouse: { x: 400, y: 300 },
+            players: new Map(), bullets: [], lobby: [], banner: '', flash: 0, feed: [], lastFire: 0, lastAimSent: 0, mouseDown: false };
+const keys = {}, logLines = [];
+function log(m) { logLines.push(m); if (logLines.length > 7) logLines.shift(); $('log').textContent = logLines.join('\n'); }
+function status(t, good) { $('st').textContent = t; $('st').className = good ? 'ok' : 'bad'; }
+
+// -------------------------------- Networking -------------------------------
+function send(str, lossy) {                         // optional artificial latency / packet loss for demos
+  const ws = net.ws; if (!ws || ws.readyState !== 1) return;
+  if (lossy && Math.random() * 100 < net.loss) { net.dropped++; return; }
+  net.lag ? setTimeout(() => ws.readyState === 1 && ws.send(str), net.lag) : ws.send(str);
+}
+let retry = 0;
+function connect() {
+  clearTimeout(retry);
+  const addr = $('addr').value.trim() || 'localhost:8080';
+  try { localStorage.setItem('srv', addr); } catch (e) {}
+  if (net.ws) { net.ws.onclose = null; net.ws.close(); }
+  status('connecting to ' + addr + ' ...', false);
+  let ws; try { ws = net.ws = new WebSocket('ws://' + addr); } catch (e) { return status('bad address', false); }
+  let opened = false;
+  ws.onopen = () => { opened = true; net.wasUp = true; status('connected to ' + addr, true); log('connected'); send('L'); };
+  ws.onmessage = e => net.lag ? setTimeout(() => onMsg(e.data), net.lag) : onMsg(e.data);
+  ws.onclose = () => {
+    S.inMatch = false; S.room = '-'; S.players.clear();
+    status(opened ? 'disconnected - retrying...' : 'cannot reach ' + addr + ' (check IP, same Wi-Fi, firewall)', false);
+    retry = setTimeout(connect, 3000);
+  };
+}
+function onMsg(raw) {
+  const m = JSON.parse(raw);
+  switch (m.t) {
+    case 'welcome': S.myId = m.id; break;
+    case 'rooms':
+      $('rooms').innerHTML = m.list.length ? m.list.map(r => `<button data-r="${r.id}" ${r.m || r.n >= r.cap ? 'disabled' : ''}>${r.id} (${r.n}/${r.cap})${r.m ? ' in match' : ''}</button>`).join(' ') : 'no open rooms - create one!';
+      for (const b of $('rooms').querySelectorAll('button')) b.onclick = () => send('J|' + b.dataset.r);
+      break;
+    case 'lobby':
+      S.room = m.room; S.lobby = m.players; S.inMatch = m.state === 'match';
+      for (const id of [...S.players.keys()]) if (!m.players.some(p => p.id === id)) S.players.delete(id);
+      renderLobby(); break;
+    case 'start':                                   // fresh match: reset prediction state
+      S.epoch = m.epoch; S.seq = 0; S.ack = 0; S.inputQueue = []; S.hp = 100;
+      S.me.x = S.srv.x = m.x; S.me.y = S.srv.y = m.y;
+      S.players.clear(); S.bullets = []; S.feed = []; S.inMatch = true; S.banner = ''; log('match started'); break;
+    case 'snap': {
+      net.snaps++; S.tick = m.tick; S.ack = m.ack; const t = performance.now();
+      for (const [id, x, y, sc, hp, aim] of m.p) {  // apply delta entries
+        let p = S.players.get(id);
+        if (!p) { p = { buf: [], x, y, rx: x, ry: y, body: 0 }; S.players.set(id, p); }
+        p.x = x; p.y = y; p.score = sc; p.hp = hp; p.aim = aim;
+        p.buf.push({ t, x, y }); if (p.buf.length > 40) p.buf.shift();   // snapshot history for interpolation
+        if (id === S.myId) { S.srv.x = x; S.srv.y = y; S.hp = hp; }
+      }
+      S.bullets = m.b;
+      if (m.k) for (const [a, b] of m.k) S.feed.push({ t, s: `${name(a)} destroyed ${name(b)}` });
+      reconcile(); break;
+    }
+    case 'rb':                                      // authoritative rollback (cheat / wall) or respawn
+      S.epoch = m.epoch; S.me.x = S.srv.x = m.x; S.me.y = S.srv.y = m.y; S.inputQueue = [];
+      if (m.why !== 'respawn') { net.rollbacks++; S.flash = 1; log(`ROLLBACK (${m.why}) -> ${m.x.toFixed(0)},${m.y.toFixed(0)}`); }
+      break;
+    case 'end': S.inMatch = false; S.banner = m.winner === S.myId ? 'VICTORY!' : m.winner ? `PLAYER ${m.winner} WINS` : 'MATCH ABORTED'; log(S.banner); break;
+    case 'pong': net.rtt = performance.now() - m.c; break;
+    case 'err': log('server: ' + m.m); break;
+  }
+}
+const name = id => id === S.myId ? 'You' : 'P' + id;
+
+// ------------------- Client-side prediction + reconciliation ----------------
+// Same collision rule as the server: push a circle out of every wall rectangle.
+function resolve(p) {
+  p.x = clamp(p.x, R, W - R); p.y = clamp(p.y, R, H - R);
+  for (const [wx, wy, ww, wh] of WALLS) {
+    const cx = clamp(p.x, wx, wx + ww), cy = clamp(p.y, wy, wy + wh), dx = p.x - cx, dy = p.y - cy, d2 = dx * dx + dy * dy;
+    if (d2 >= R * R) continue;
+    if (d2 > 1e-9) { const d = Math.sqrt(d2); p.x = cx + dx / d * R; p.y = cy + dy / d * R; }
+    else { const l = p.x - wx, r = wx + ww - p.x, t = p.y - wy, b = wy + wh - p.y, mn = Math.min(l, r, t, b);
+           if (mn === l) p.x = wx - R; else if (mn === r) p.x = wx + ww + R; else if (mn === t) p.y = wy - R; else p.y = wy + wh + R; }
+  }
+}
+// One movement step. Used for BOTH live prediction and replay so they match exactly.
+function applyInput(pos, i) { pos.x += i.dx * SPEED * i.dt; pos.y += i.dy * SPEED * i.dt; resolve(pos); }
+function reconcile() {
+  const bx = S.me.x, by = S.me.y;
+  while (S.inputQueue.length && S.inputQueue[0].seq <= S.ack) S.inputQueue.shift();   // 1. drop confirmed inputs
+  const pos = { x: S.srv.x, y: S.srv.y };                                              // 2. start from server truth
+  for (const i of S.inputQueue) applyInput(pos, i);                                    // 3. replay pending inputs
+  net.replayed = S.inputQueue.length;
+  net.lastErr = Math.hypot(pos.x - bx, pos.y - by); net.maxErr = Math.max(net.maxErr, net.lastErr);
+  S.me.x = pos.x; S.me.y = pos.y;
+}
+let lastStep = performance.now();
+function stepLocal(now) {
+  const el = now - lastStep; if (el < 14) return;   // cap input rate at ~60/s on fast monitors
+  lastStep = now; const dt = Math.min(el / 1000, 0.05);
+  if (!S.inMatch || S.hp <= 0) return;
+  S.aim = Math.atan2(S.mouse.y - S.me.y, S.mouse.x - S.me.x);
+  let dx = (keys.d || keys.arrowright ? 1 : 0) - (keys.a || keys.arrowleft ? 1 : 0);
+  let dy = (keys.s || keys.arrowdown ? 1 : 0) - (keys.w || keys.arrowup ? 1 : 0);
+  if (dx || dy) {
+    const l = Math.hypot(dx, dy); dx /= l; dy /= l;
+    const inp = { seq: ++S.seq, dx, dy, dt };
+    applyInput(S.me, inp);                          // predict immediately: zero perceived latency
+    S.inputQueue.push(inp);                         // keep until the server acknowledges it
+    S.body = Math.atan2(dy, dx);
+    send(`I|${S.epoch}|${inp.seq}|${now.toFixed(3)}|${S.me.x.toFixed(3)}|${S.me.y.toFixed(3)}`, true);
+    net.sent++;
+  }
+  if (now - S.lastAimSent > 50) { S.lastAimSent = now; send('A|' + S.aim.toFixed(3)); }
+  if ((S.mouseDown || keys[' ']) && now - S.lastFire > FIRE_CD) { S.lastFire = now; send('F|' + S.aim.toFixed(3)); }
+}
+
+// --------------------------------- Rendering --------------------------------
+function interp(p, now) {                           // entity interpolation: render remotes 100 ms in the past
+  const rt = now - INTERP_MS, b = p.buf; if (!b.length) return { x: p.x, y: p.y };
+  for (let i = b.length - 1; i > 0; i--) if (b[i - 1].t <= rt) {
+    const a = b[i - 1], c = b[i], k = c.t === a.t ? 1 : clamp((rt - a.t) / (c.t - a.t), 0, 1);
+    return { x: a.x + (c.x - a.x) * k, y: a.y + (c.y - a.y) * k };
+  }
+  return { x: b[0].x, y: b[0].y };
+}
+function drawGround(t) {
+  const g = ctx.createRadialGradient(W / 2, H / 2, 80, W / 2, H / 2, 520); g.addColorStop(0, '#e2d3ad'); g.addColorStop(1, '#c7b385');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = 'rgba(80,60,20,0.10)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let x = 0; x <= W; x += 40) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+  for (let y = 0; y <= H; y += 40) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke();
+  for (const [wx, wy, ww, wh] of WALLS) {          // concrete bunkers with drop shadow + highlight
+    ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fillRect(wx + 5, wy + 6, ww, wh);
+    ctx.fillStyle = '#6d7077'; ctx.fillRect(wx, wy, ww, wh);
+    ctx.fillStyle = '#8b8f97'; ctx.fillRect(wx, wy, ww, 4);
+    ctx.strokeStyle = '#43464b'; ctx.lineWidth = 2; ctx.strokeRect(wx, wy, ww, wh);
+  }
+}
+function drawTank(x, y, body, aim, col, label, hp, me) {
+  ctx.save(); ctx.translate(x, y);
+  ctx.fillStyle = 'rgba(0,0,0,0.22)'; ctx.beginPath(); ctx.ellipse(3, 5, 20, 15, 0, 0, 7); ctx.fill();
+  ctx.rotate(body);
+  ctx.fillStyle = '#2b2b2b'; ctx.fillRect(-19, -16, 38, 8); ctx.fillRect(-19, 8, 38, 8);      // tracks
+  ctx.fillStyle = col; ctx.fillRect(-16, -11, 32, 22); ctx.strokeStyle = 'rgba(0,0,0,.5)'; ctx.lineWidth = 2; ctx.strokeRect(-16, -11, 32, 22);
+  ctx.rotate(aim - body);
+  ctx.fillStyle = '#333'; ctx.fillRect(0, -3, 27, 6);                                          // barrel
+  ctx.fillStyle = col; ctx.beginPath(); ctx.arc(0, 0, 10, 0, 7); ctx.fill(); ctx.stroke();      // turret
+  ctx.restore();
+  ctx.textAlign = 'center'; ctx.font = (me ? 'bold ' : '') + '12px system-ui'; ctx.fillStyle = me ? '#0b3fa8' : '#222';
+  ctx.fillText(label, x, y - 30);
+  ctx.fillStyle = 'rgba(0,0,0,.45)'; ctx.fillRect(x - 18, y - 26, 36, 5);                       // hp bar
+  ctx.fillStyle = hp > 50 ? '#3cb043' : hp > 25 ? '#e6a700' : '#d33'; ctx.fillRect(x - 18, y - 26, 36 * clamp(hp, 0, 100) / 100, 5);
+}
+let lastRender = performance.now();
+function render(now) {
+  const dt = Math.min((now - lastRender) / 1000, 0.1); lastRender = now;
+  drawGround(now);
+  ctx.fillStyle = '#222';
+  for (const [, x, y] of S.bullets) { ctx.beginPath(); ctx.arc(x, y, 4, 0, 7); ctx.fill(); }
+  const ids = [...S.players.keys()].sort((a, b) => a - b);
+  for (const id of ids) {
+    if (id === S.myId) continue;
+    const p = S.players.get(id); if (p.hp <= 0) continue;
+    const q = interp(p, now), mv = Math.hypot(q.x - p.rx, q.y - p.ry);
+    if (mv > 0.15) p.body = Math.atan2(q.y - p.ry, q.x - p.rx);
+    p.rx = q.x; p.ry = q.y;
+    drawTank(q.x, q.y, p.body, p.aim, COLORS[1 + (ids.indexOf(id) % 3)], 'P' + id, p.hp, false);
+  }
+  if (S.inMatch && S.hp > 0) {
+    if ($('ghost').checked) { ctx.strokeStyle = 'rgba(0,0,0,.55)'; ctx.setLineDash([4, 3]); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(S.srv.x, S.srv.y, R + 3, 0, 7); ctx.stroke(); ctx.setLineDash([]); }
+    drawTank(S.me.x, S.me.y, S.body, S.aim, COLORS[0], 'You - Authoritative', S.hp, true);
+  }
+  // crosshair
+  if (S.inMatch) { ctx.strokeStyle = '#a00'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(S.mouse.x, S.mouse.y, 9, 0, 7); ctx.moveTo(S.mouse.x - 14, S.mouse.y); ctx.lineTo(S.mouse.x + 14, S.mouse.y); ctx.moveTo(S.mouse.x, S.mouse.y - 14); ctx.lineTo(S.mouse.x, S.mouse.y + 14); ctx.stroke(); }
+  // HUD
+  ctx.fillStyle = 'rgba(30,24,10,.72)'; ctx.fillRect(0, 0, W, 28);
+  ctx.fillStyle = '#f3e7c4'; ctx.textAlign = 'left'; ctx.font = '13px Consolas,monospace';
+  ctx.fillText(`LOBBY ${S.room}   CONN #${S.myId || '-'}   TICK ${S.tick}   ACK ${S.ack}   RTT ${net.rtt.toFixed(0)}ms   PRED ${S.inputQueue.length} pending / err ${net.lastErr.toFixed(2)}px`, 10, 18);
+  ctx.textAlign = 'right'; let y = 48; ctx.font = 'bold 13px system-ui';
+  ctx.fillStyle = '#2a2418'; ctx.fillText('KILLS (first to 8)', W - 12, y); y += 18; ctx.font = '13px system-ui';
+  for (const id of ids) { ctx.fillStyle = id === S.myId ? COLORS[0] : COLORS[1 + (ids.indexOf(id) % 3)]; ctx.fillText(`${name(id)}: ${S.players.get(id).score}`, W - 12, y); y += 17; }
+  ctx.textAlign = 'left'; y = 48;
+  S.feed = S.feed.filter(f => now - f.t < 4500);
+  ctx.fillStyle = '#2a2418'; for (const f of S.feed) { ctx.fillText(f.s, 12, y); y += 17; }
+  if (S.inMatch && S.hp <= 0) { ctx.fillStyle = 'rgba(120,0,0,.35)'; ctx.fillRect(0, 0, W, H); ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.font = 'bold 30px system-ui'; ctx.fillText('DESTROYED - respawning...', W / 2, H / 2); }
+  if (S.flash > 0) { ctx.fillStyle = `rgba(255,0,60,${S.flash * 0.35})`; ctx.fillRect(0, 0, W, H); S.flash = Math.max(0, S.flash - dt * 2); }
+  if (!S.inMatch) {
+    ctx.fillStyle = 'rgba(30,24,10,.62)'; ctx.fillRect(0, 0, W, H); ctx.textAlign = 'center';
+    ctx.fillStyle = '#f3e7c4'; ctx.font = 'bold 30px system-ui';
+    ctx.fillText(S.banner || (!net.ws || net.ws.readyState !== 1 ? 'CONNECT TO A SERVER' : S.room === '-' ? 'JOIN A ROOM' : 'WAITING FOR PLAYERS'), W / 2, H / 2 - 10);
+    ctx.font = '15px system-ui'; ctx.fillText('Match starts when 2+ players are all Ready.   Move: WASD   Aim: mouse   Fire: click / Space', W / 2, H / 2 + 22);
+  }
+}
+function renderLobby() {
+  $('lobby').innerHTML = `Room <b>${S.room}</b><br>` + S.lobby.map(p => `${p.id === S.myId ? '&gt; You' : 'Player'} #${p.id}: ${p.ready ? '<b>READY</b>' : 'waiting'}`).join('<br>');
+}
+function updateTelemetry() {
+  net.snapRate = net.snaps; net.snaps = 0;
+  $('tel').textContent =
+`RTT           : ${net.rtt.toFixed(0)} ms (+${net.lag * 2} sim)
+snapshots/sec : ${net.snapRate}
+inputs sent   : ${net.sent}  (dropped by sim: ${net.dropped})
+epoch / seq   : ${S.epoch} / ${S.seq}
+server ack    : ${S.ack}
+pending queue : ${S.inputQueue.length}
+last replay   : ${net.replayed} inputs
+recon. error  : ${net.lastErr.toFixed(3)} px (max ${net.maxErr.toFixed(2)})
+rollbacks     : ${net.rollbacks}
+interpolation : ${INTERP_MS} ms buffer`;
+}
+
+// ------------------------------- Wiring / loop ------------------------------
+addEventListener('keydown', e => { const k = e.key.toLowerCase(); if (document.activeElement.tagName === 'INPUT') return; keys[k] = true; if ((k.startsWith('arrow') || k === ' ') && S.inMatch) e.preventDefault(); });
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; S.mouseDown = false; });
+cv.addEventListener('mousemove', e => { const r = cv.getBoundingClientRect(); S.mouse.x = (e.clientX - r.left) * W / r.width; S.mouse.y = (e.clientY - r.top) * H / r.height; });
+cv.addEventListener('mousedown', () => { S.mouseDown = true; });
+addEventListener('mouseup', () => { S.mouseDown = false; });
+$('conn').onclick = connect;
+$('join').onclick = () => send('J|' + $('room').value.trim());
+$('ready').onclick = () => send('R');
+$('lag').onchange = e => { net.lag = +e.target.value; log('simulated one-way lag: ' + net.lag + 'ms'); };
+$('loss').onchange = e => { net.loss = +e.target.value; log('simulated input loss: ' + net.loss + '%'); };
+$('hack').onclick = () => {                         // forge an impossible jump to exercise the server gate
+  if (!S.inMatch) return log('start a match first');
+  const x = S.me.x < W / 2 ? S.me.x + 300 : S.me.x - 300;
+  send(`I|${S.epoch}|${++S.seq}|${performance.now().toFixed(3)}|${x.toFixed(3)}|${S.me.y.toFixed(3)}`);
+  log('sent forged +300px teleport');
+};
+setInterval(() => { send('P|' + performance.now().toFixed(3)); if (S.room === '-') send('L'); }, 1000);
+setInterval(updateTelemetry, 1000);
+function frame(t) { stepLocal(t); render(t); requestAnimationFrame(frame); }
+// Address: when served by the C++ server, the page's own host is already correct on EVERY device.
+let saved = ''; try { saved = localStorage.getItem('srv') || ''; } catch (e) {}
+$('addr').value = location.protocol.startsWith('http') ? location.host : (saved || 'localhost:8080');
+connect(); requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
